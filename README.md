@@ -72,7 +72,9 @@ logi_scroll uninstall           # 移除开机自启
 - 实测：**MX Anywhere 3S**（蓝牙直连，PID 0xB037）
 - 理论支持所有 HID++ 2.0 且 `0x2121` capabilities 中 `has_invert=1` 的罗技鼠标
   （MX Master 3 / Anywhere 2S/3 系列等），蓝牙、有线直连均可
-- 经 Unifying/Bolt 接收器连接：需要接收器设备枚举，**暂未实现**
+- **Unifying / Bolt 接收器**：已实现（HID++ 2.0 特性 `0x0005` 设备发现，
+  按配对槽位 1...N 寻址），⚠️ 未经真机实测，如插上接收器后识别不到请提 issue；
+  短回复单次最多返回 3 个设备条目，槽位 4-6 的鼠标暂不会被发现
 
 ## 注意事项
 

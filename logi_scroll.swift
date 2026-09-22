@@ -98,25 +98,28 @@ func registryPath(_ dev: IOHIDDevice) -> String {
 }
 
 /// 一个罗技 HID++ 2.0 设备。通信走 hidapi（写报告 → 读回复）。
+/// deviceIndex: 蓝牙/有线直连为 0xFF；经接收器时为其配对槽位 1...N。
 final class LogiDevice {
     let dev: IOHIDDevice
     let name: String
     let serial: String
     let pid: UInt32
     let path: String
+    let deviceIndex: UInt8
     let key: String
     var wheelFeatureIndex: UInt8 = 0
     private var shortWorks = false
     private var longWorks = false
     private var handle: UnsafeMutableRawPointer?
 
-    init(_ dev: IOHIDDevice, name: String, serial: String, pid: UInt32) {
+    init(_ dev: IOHIDDevice, name: String, serial: String, pid: UInt32, deviceIndex: UInt8 = DEV_IDX_DIRECT) {
         self.dev = dev
         self.name = name
         self.serial = serial
         self.pid = pid
         self.path = registryPath(dev)
-        self.key = "\(serial):\(pid)"
+        self.deviceIndex = deviceIndex
+        self.key = "\(path)|\(deviceIndex)|\(serial)|\(pid)"
     }
 
     var modelName: String {
@@ -149,7 +152,7 @@ final class LogiDevice {
         guard let h = handle else {
             throw HidppError(message: "设备未打开")
         }
-        let header = [DEV_IDX_DIRECT, featureIndex, (function << 4) | SW_ID]
+        let header = [deviceIndex, featureIndex, (function << 4) | SW_ID]
         var useLong = longWorks && !shortWorks
         while true {
             var msg: [UInt8]
@@ -196,19 +199,53 @@ final class LogiDevice {
         }
     }
 
+    /// Root fn0 GetFeature：按特性 ID 查特性索引；无响应或不存在返回 nil。
+    func getFeatureIndex(_ featureID: UInt16) -> UInt8? {
+        guard let r = try? call(featureIndex: 0x00, function: 0x00,
+                                params: [UInt8(featureID & 0xFF), UInt8(featureID >> 8), 0x00]),
+              r[0] != 0 else { return nil }
+        return r[0]
+    }
+
     /// 确认设备支持 0x2121 且带 has_invert。返回 (caps, mode)，不支持抛错。
     func probe() throws -> ([UInt8], [UInt8]) {
-        let r = try call(featureIndex: 0x00, function: 0x00, params: [0x21, 0x21, 0x00]) // Root fn0 GetFeature
-        wheelFeatureIndex = r[0]
-        guard wheelFeatureIndex != 0 else {
+        guard let fi = getFeatureIndex(FEATURE_HIRES_WHEEL) else {
             throw HidppError(message: "设备不支持 0x2121")
         }
+        wheelFeatureIndex = fi
         let caps = try call(featureIndex: wheelFeatureIndex, function: 0x00, params: [0, 0, 0])
         let mode = try call(featureIndex: wheelFeatureIndex, function: 0x01, params: [0, 0, 0])
         guard caps.count > 1, caps[1] & 0x08 != 0 else {
             throw HidppError(message: "不支持滚轮反转（has_invert=否）")
         }
         return (caps, mode)
+    }
+
+    /// 接收器设备发现（HID++ 2.0 特性 0x0005 fn0）。
+    /// 返回在线且为鼠标类的配对设备 (槽位索引, PID)。
+    /// 报文: [count, flags, pid0_lo, pid0_hi, type0, online0, ...]，
+    /// type 位1 = 鼠标，位5 = 轨迹球；短回复最多容纳 3 个设备条目。
+    func discoverReceiverMice() throws -> [(index: UInt8, pid: UInt32)] {
+        guard let fi = getFeatureIndex(0x0005) else {
+            throw HidppError(message: "无设备发现特性（非接收器）")
+        }
+        let r = try call(featureIndex: fi, function: 0x00, params: [0, 0, 0])
+        let count = Int(r[0])
+        guard count > 0 else {
+            throw HidppError(message: "接收器无配对设备")
+        }
+        var mice: [(index: UInt8, pid: UInt32)] = []
+        for i in 0..<min(count, 3) {
+            let off = 2 + 4 * i
+            guard off + 4 <= r.count else { break }
+            let pid = UInt32(r[off]) | (UInt32(r[off + 1]) << 8)
+            let type = r[off + 2]
+            let online = r[off + 3]
+            if online == 1 && type & 0x22 != 0 {  // 鼠标(0x02) 或轨迹球(0x20)
+                mice.append((index: UInt8(i + 1), pid: pid))
+            }
+        }
+        return mice
     }
 
     func setMode(_ modeByte: UInt8) throws -> UInt8 {
@@ -239,45 +276,69 @@ final class LogiDevice {
 
 // MARK: - 命令实现
 
+/// 把一个设备（直连鼠标或接收器）解析成可操作的目标列表。
+/// 直连优先；探测不到 0x2121 时尝试接收器设备发现（0x0005）。
+/// 注意：同一物理设备同一时刻只能有一个打开的 hidapi 句柄（独占访问），
+/// 切换目标前必须先关闭直连句柄。
+func resolveTargets(_ dev: IOHIDDevice) -> [(device: LogiDevice, label: String)] {
+    let name = deviceProp(dev, kIOHIDProductKey) as? String ?? ""
+    let serial = deviceProp(dev, kIOHIDSerialNumberKey) as? String ?? ""
+    let pid = (deviceProp(dev, kIOHIDProductIDKey) as? NSNumber)?.uint32Value ?? 0
+    let direct = LogiDevice(dev, name: name, serial: serial, pid: pid)
+    if !direct.open() {
+        return [(direct, direct.modelName)]  // 交给调用方报"打开失败"
+    }
+    if (try? direct.probe()) != nil {
+        return [(direct, direct.modelName)]
+    }
+    if let mice = try? direct.discoverReceiverMice() {
+        direct.close()
+        return mice.map { m in
+            let d = LogiDevice(dev, name: "", serial: serial, pid: m.pid, deviceIndex: m.index)
+            let via = PID_NAMES[m.pid] ?? String(format: "PID 0x%04X", m.pid)
+            return (d, "\(via)（接收器槽位 \(m.index)）")
+        }
+    }
+    return [(direct, direct.modelName)]
+}
+
 func runDaemon() {
     let mgr = makeManager()
-    var handles: [String: LogiDevice] = [:]
     var applied = Set<String>()
+    var lastFailLog: [String: Date] = [:]
     log("守护启动，轮询罗技设备……")
     while true {
-        var seen = Set<String>()
+        var seenPaths = Set<String>()
         for dev in enumerate(mgr) {
-            let name = deviceProp(dev, kIOHIDProductKey) as? String ?? ""
-            let serial = deviceProp(dev, kIOHIDSerialNumberKey) as? String ?? ""
-            let pid = (deviceProp(dev, kIOHIDProductIDKey) as? NSNumber)?.uint32Value ?? 0
-            let key = "\(serial):\(pid)"
-            seen.insert(key)
-            if applied.contains(key) { continue }
-            let d = handles[key] ?? LogiDevice(dev, name: name, serial: serial, pid: pid)
-            handles[key] = d
-            if !d.open() {
-                log("\(d.modelName): 打开设备失败")
-                continue
-            }
-            let (ok, msg) = d.applyInvert(true)
-            // 应用成功后立即释放设备：status/toggle 等其他进程需要能并发打开
-            // （蓝牙设备只允许一个客户端持有，常开句柄会导致独占访问冲突）
-            d.close()
-            handles.removeValue(forKey: key)
-            if ok {
-                applied.insert(key)
-                log("\(d.modelName) (\(serial)) 反转已生效：\(msg)")
-            } else {
-                // 失败则下个周期重试（可能设备在重连/休眠）
-                log("\(d.modelName) 暂不可用：\(msg)")
+            let path = registryPath(dev)
+            seenPaths.insert(path)
+            // 该物理设备（或其接收器下的鼠标）已应用过则跳过，避免每轮唤醒探测
+            if applied.contains(where: { $0.hasPrefix(path + "|") }) { continue }
+            for (d, label) in resolveTargets(dev) {
+                if applied.contains(d.key) { continue }
+                if !d.open() {
+                    log("\(label): 打开设备失败")
+                    continue
+                }
+                let (ok, msg) = d.applyInvert(true)
+                // 应用完立即释放设备：status/toggle 等其他进程需要能并发打开
+                // （蓝牙设备只允许一个客户端持有，常开句柄会导致独占访问冲突）
+                d.close()
+                if ok {
+                    applied.insert(d.key)
+                    log("\(label) (\(d.serial)) 反转已生效：\(msg)")
+                } else if Date().timeIntervalSince(lastFailLog[d.key] ?? .distantPast) > 30 {
+                    // 限频：失败信息每 30 秒最多打一次（接收器无鼠标时避免刷屏）
+                    lastFailLog[d.key] = Date()
+                    log("\(label) 暂不可用：\(msg)")
+                }
             }
         }
-        for k in handles.keys where !seen.contains(k) {
-            handles[k]?.close()
-            handles.removeValue(forKey: k)
-            if applied.remove(k) != nil {
-                log("设备断开，等待重连")
-            }
+        // 设备断开后清状态，重连时重新应用
+        for k in applied where !seenPaths.contains(String(k.split(separator: "|").first ?? "")) {
+            applied.remove(k)
+            lastFailLog.removeValue(forKey: k)
+            log("设备断开，等待重连")
         }
         Thread.sleep(forTimeInterval: POLL_SECONDS)
     }
@@ -291,24 +352,22 @@ func cmdStatus() {
         return
     }
     for dev in devs {
-        let name = deviceProp(dev, kIOHIDProductKey) as? String ?? ""
-        let serial = deviceProp(dev, kIOHIDSerialNumberKey) as? String ?? ""
-        let pid = (deviceProp(dev, kIOHIDProductIDKey) as? NSNumber)?.uint32Value ?? 0
-        let d = LogiDevice(dev, name: name, serial: serial, pid: pid)
-        defer { d.close() }
-        if !d.open() {
-            print("\(d.modelName): 无法打开设备")
-            continue
-        }
-        do {
-            let (caps, mode) = try d.probe()
-            let m = mode[0]
-            print("\(d.modelName) (serial=\(serial), path=\(d.path))")
-            print("  inverted=\(m & 4 != 0 ? "是" : "否")  resolution=\(m & 2 != 0 ? "hi-res" : "low")  "
-                  + "target=\(m & 1 != 0 ? "diverted" : "native")  has_invert=\(caps[1] & 8 != 0 ? "是" : "否")  "
-                  + "棘轮齿数=\(caps[2])  直径=\(caps[3])mm")
-        } catch {
-            print("\(d.modelName): \(error)")
+        for (d, label) in resolveTargets(dev) {
+            defer { d.close() }
+            if !d.open() {
+                print("\(label): 无法打开设备")
+                continue
+            }
+            do {
+                let (caps, mode) = try d.probe()
+                let m = mode[0]
+                print("\(label) (serial=\(d.serial), path=\(d.path))")
+                print("  inverted=\(m & 4 != 0 ? "是" : "否")  resolution=\(m & 2 != 0 ? "hi-res" : "low")  "
+                      + "target=\(m & 1 != 0 ? "diverted" : "native")  has_invert=\(caps[1] & 8 != 0 ? "是" : "否")  "
+                      + "棘轮齿数=\(caps[2])  直径=\(caps[3])mm")
+            } catch {
+                print("\(label): \(error)")
+            }
         }
     }
 }
@@ -321,27 +380,25 @@ func cmdToggle(force: Bool?) {
         return
     }
     for dev in devs {
-        let name = deviceProp(dev, kIOHIDProductKey) as? String ?? ""
-        let serial = deviceProp(dev, kIOHIDSerialNumberKey) as? String ?? ""
-        let pid = (deviceProp(dev, kIOHIDProductIDKey) as? NSNumber)?.uint32Value ?? 0
-        let d = LogiDevice(dev, name: name, serial: serial, pid: pid)
-        defer { d.close() }
-        if !d.open() {
-            print("\(d.modelName): 无法打开设备")
-            continue
-        }
-        var want = force
-        if want == nil {
-            do {
-                let (_, mode) = try d.probe()
-                want = mode[0] & WHEEL_INVERT == 0
-            } catch {
-                print("\(d.modelName): \(error)")
+        for (d, label) in resolveTargets(dev) {
+            defer { d.close() }
+            if !d.open() {
+                print("\(label): 无法打开设备")
                 continue
             }
+            var want = force
+            if want == nil {
+                do {
+                    let (_, mode) = try d.probe()
+                    want = mode[0] & WHEEL_INVERT == 0
+                } catch {
+                    print("\(label): \(error)")
+                    continue
+                }
+            }
+            let (ok, msg) = d.applyInvert(want!)
+            print("\(label): \(want! ? "反转" : "正常") -> \(ok ? "OK" : "失败") (\(msg))")
         }
-        let (ok, msg) = d.applyInvert(want!)
-        print("\(d.modelName): \(want! ? "反转" : "正常") -> \(ok ? "OK" : "失败") (\(msg))")
     }
 }
 
@@ -386,8 +443,12 @@ func cmdInstall() {
     try? FileManager.default.createDirectory(atPath: (AGENT_PLIST as NSString).deletingLastPathComponent,
                                              withIntermediateDirectories: true)
     try? plist.write(toFile: AGENT_PLIST, atomically: true, encoding: .utf8)
-    let _ = try? Process.run(URL(fileURLWithPath: "/bin/launchctl"),
-                             arguments: ["bootout", "gui/\(getuid())/\(AGENT_LABEL)"]) { _ in }
+    // 同步等 bootout 完成再 bootstrap（首次安装没有旧任务，失败可忽略）
+    let boot = Process()
+    boot.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    boot.arguments = ["bootout", "gui/\(getuid())/\(AGENT_LABEL)"]
+    try? boot.run()
+    boot.waitUntilExit()
     let r = Process()
     r.executableURL = URL(fileURLWithPath: "/bin/launchctl")
     r.arguments = ["bootstrap", "gui/\(getuid())", AGENT_PLIST]
