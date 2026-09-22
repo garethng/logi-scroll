@@ -1,0 +1,9 @@
+# 构建产物
+build/
+logi_scroll
+
+# macOS
+.DS_Store
+
+# Claude Code 会话数据
+.claude/
