@@ -1,7 +1,8 @@
 // logi_scroll — 罗技鼠标滚轮方向反转守护工具（原生独立进程，仅本机使用）
 //
 // 后台检测连接的罗技鼠标（蓝牙/接收器/有线），识别型号，通过 HID++ 2.0
-// 特性 0x2121 (HiResWheel) 把滚轮方向硬件级反转（设置存在设备里，重连后依然生效）。
+// 特性 0x2121 (HiResWheel) 把滚轮方向硬件级反转。注意该设置存在鼠标易失内存里：
+// 深度睡眠唤醒后固件会复位，所以守护模式会周期性复检并自动补写。
 //
 // 协议参考 OpenLogi (https://github.com/AprilNEA/OpenLogi, Apache-2.0/MIT):
 //   - HID++ 2.0 短报告: [0x10, dev_idx, feat_idx, func|sw, p0, p1, p2]  (7 字节)
@@ -17,7 +18,7 @@
 // 而 hidapi 的独立读线程实现工作正常。
 //
 // 用法:
-//   logi_scroll run                 守护模式：轮询检测并保持反转（开机自启用）
+//   logi_scroll run                 守护模式：轮询检测并保持反转，睡眠唤醒自动恢复（开机自启用）
 //   logi_scroll status              列出当前连接的罗技设备及滚轮状态
 //   logi_scroll toggle [--on|--off] 一次性切换反转方向（默认来回切换）
 //   logi_scroll install             安装 LaunchAgent 开机自启
@@ -35,6 +36,8 @@ let SW_ID: UInt8 = 0x01
 let FEATURE_HIRES_WHEEL: UInt16 = 0x2121
 let WHEEL_INVERT: UInt8 = 0x04
 let POLL_SECONDS: TimeInterval = 2
+let REVERIFY_SECONDS: TimeInterval = 30   // 已应用设备复检间隔（睡眠唤醒后固件可能清掉反转位）
+let FAIL_BACKOFF_SECONDS: TimeInterval = 30  // 打开/应用失败后的退避与日志限频
 
 let AGENT_LABEL = "com.garethng.logi-scroll"
 let AGENT_PLIST = NSHomeDirectory() + "/Library/LaunchAgents/\(AGENT_LABEL).plist"
@@ -126,10 +129,10 @@ final class LogiDevice {
         name.isEmpty ? (PID_NAMES[pid] ?? String(format: "PID 0x%04X", pid)) : name
     }
 
-    func open() -> Bool {
+    func open(silent: Bool = false) -> Bool {
         if handle != nil { return true }
         guard let h = logiHidOpen(path) else {
-            if let err = logiHidError(nil) {
+            if !silent, let err = logiHidError(nil) {
                 log("hidapi 错误: \(String(decodingCString: UnsafeRawPointer(err).assumingMemoryBound(to: UInt32.self), as: UTF32.self)) (path=\(path))")
             }
             return false
@@ -272,6 +275,21 @@ final class LogiDevice {
             return (false, "\(error)")
         }
     }
+    /// 复检并维持反转：反转位还在则不写入；丢失则重新写入。
+    /// 探测失败抛错（鼠标睡眠中无响应属预期，守护进程静默跳过）。
+    func reapplyInvertIfNeeded() throws -> (reapplied: Bool, desc: String) {
+        let (_, mode) = try probe()
+        let current = mode[0]
+        if current & WHEEL_INVERT != 0 {
+            return (false, "反转保持")
+        }
+        let new = (current & 0x02) | WHEEL_INVERT
+        let back = try setMode(new)
+        let desc = String(format: "mode 0x%02X -> 0x%02X (inverted=%@, target=%@)",
+                          current, back, back & WHEEL_INVERT != 0 ? "是" : "否",
+                          back & 1 != 0 ? "diverted" : "native")
+        return (true, desc)
+    }
 }
 
 // MARK: - 命令实现
@@ -280,12 +298,12 @@ final class LogiDevice {
 /// 直连优先；探测不到 0x2121 时尝试接收器设备发现（0x0005）。
 /// 注意：同一物理设备同一时刻只能有一个打开的 hidapi 句柄（独占访问），
 /// 切换目标前必须先关闭直连句柄。
-func resolveTargets(_ dev: IOHIDDevice) -> [(device: LogiDevice, label: String)] {
+func resolveTargets(_ dev: IOHIDDevice, silent: Bool = false) -> [(device: LogiDevice, label: String)] {
     let name = deviceProp(dev, kIOHIDProductKey) as? String ?? ""
     let serial = deviceProp(dev, kIOHIDSerialNumberKey) as? String ?? ""
     let pid = (deviceProp(dev, kIOHIDProductIDKey) as? NSNumber)?.uint32Value ?? 0
     let direct = LogiDevice(dev, name: name, serial: serial, pid: pid)
-    if !direct.open() {
+    if !direct.open(silent: silent) {
         return [(direct, direct.modelName)]  // 交给调用方报"打开失败"
     }
     if (try? direct.probe()) != nil {
@@ -305,19 +323,52 @@ func resolveTargets(_ dev: IOHIDDevice) -> [(device: LogiDevice, label: String)]
 func runDaemon() {
     let mgr = makeManager()
     var applied = Set<String>()
-    var lastFailLog: [String: Date] = [:]
+    var lastFailLog: [String: Date] = [:]  // path → 最近失败时间（失败退避 + 日志限频）
+    var lastVerify: [String: Date] = [:]   // key → 最近复检时间
     log("守护启动，轮询罗技设备……")
     while true {
         var seenPaths = Set<String>()
         for dev in enumerate(mgr) {
             let path = registryPath(dev)
             seenPaths.insert(path)
-            // 该物理设备（或其接收器下的鼠标）已应用过则跳过，避免每轮唤醒探测
-            if applied.contains(where: { $0.hasPrefix(path + "|") }) { continue }
-            for (d, label) in resolveTargets(dev) {
+            // 失败退避：最近打开/应用失败过的 path 30 秒内不再尝试（避免日志刷屏）
+            if let t = lastFailLog[path], Date().timeIntervalSince(t) < FAIL_BACKOFF_SECONDS { continue }
+            // 已应用过的设备：睡眠唤醒后固件可能清掉反转位，周期性复检并补写。
+            // 蓝牙睡眠唤醒不换 registry path，只能靠复检发现。
+            if let key = applied.first(where: { $0.hasPrefix(path + "|") }) {
+                guard Date().timeIntervalSince(lastVerify[key] ?? .distantPast) >= REVERIFY_SECONDS else { continue }
+                lastVerify[key] = Date()
+                // 从 key 还原目标（path|deviceIndex|serial|pid），避免整轮重新探测
+                let parts = key.split(separator: "|").map(String.init)
+                guard parts.count == 4 else { continue }
+                let d = LogiDevice(dev,
+                                   name: "",
+                                   serial: parts[2],
+                                   pid: UInt32(parts[3]) ?? 0,
+                                   deviceIndex: UInt8(parts[1]) ?? DEV_IDX_DIRECT)
+                if !d.open(silent: true) {
+                    lastFailLog[path] = Date()
+                    log("\(d.modelName): 复检打不开设备（\(Int(FAIL_BACKOFF_SECONDS)) 秒后重试）")
+                } else {
+                    do {
+                        let (reapplied, msg) = try d.reapplyInvertIfNeeded()
+                        lastFailLog[path] = nil
+                        if reapplied {
+                            log("\(d.modelName): 检测到反转丢失，已重新应用（\(msg)）")
+                        }
+                    } catch {
+                        // 鼠标睡眠中探测无响应属预期，静默跳过
+                    }
+                    d.close()
+                }
+                continue
+            }
+            // 新设备：探测并首次应用
+            for (d, label) in resolveTargets(dev, silent: true) {
                 if applied.contains(d.key) { continue }
-                if !d.open() {
-                    log("\(label): 打开设备失败")
+                if !d.open(silent: true) {
+                    lastFailLog[path] = Date()
+                    log("\(label): 打开设备失败（\(Int(FAIL_BACKOFF_SECONDS)) 秒后重试）")
                     continue
                 }
                 let (ok, msg) = d.applyInvert(true)
@@ -326,11 +377,12 @@ func runDaemon() {
                 d.close()
                 if ok {
                     applied.insert(d.key)
+                    lastVerify[d.key] = Date()
+                    lastFailLog[path] = nil
                     log("\(label) (\(d.serial)) 反转已生效：\(msg)")
-                } else if Date().timeIntervalSince(lastFailLog[d.key] ?? .distantPast) > 30 {
-                    // 限频：失败信息每 30 秒最多打一次（接收器无鼠标时避免刷屏）
-                    lastFailLog[d.key] = Date()
-                    log("\(label) 暂不可用：\(msg)")
+                } else {
+                    lastFailLog[path] = Date()
+                    log("\(label) 暂不可用：\(msg)（\(Int(FAIL_BACKOFF_SECONDS)) 秒后重试）")
                 }
             }
         }
@@ -338,6 +390,7 @@ func runDaemon() {
         for k in applied where !seenPaths.contains(String(k.split(separator: "|").first ?? "")) {
             applied.remove(k)
             lastFailLog.removeValue(forKey: k)
+            lastVerify.removeValue(forKey: k)
             log("设备断开，等待重连")
         }
         Thread.sleep(forTimeInterval: POLL_SECONDS)
@@ -477,7 +530,7 @@ func cmdUninstall() {
 func usage() {
     print("""
     用法: logi_scroll <run|status|toggle|install|uninstall>
-      run                 守护模式：轮询检测并保持反转
+      run                 守护模式：轮询检测并保持反转，睡眠唤醒自动恢复
       status              列出当前连接的罗技设备及滚轮状态
       toggle [--on|--off] 切换反转方向（默认来回切换）
       install             安装 LaunchAgent 开机自启
