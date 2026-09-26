@@ -1,8 +1,9 @@
 // logi_scroll — 罗技鼠标滚轮方向反转守护工具（原生独立进程，仅本机使用）
 //
 // 后台检测连接的罗技鼠标（蓝牙/接收器/有线），识别型号，通过 HID++ 2.0
-// 特性 0x2121 (HiResWheel) 把滚轮方向硬件级反转。注意该设置存在鼠标易失内存里：
-// 深度睡眠唤醒后固件会复位，所以守护模式会周期性复检并自动补写。
+// 特性 0x2121 (HiResWheel) 把滚轮方向硬件级反转。该设置存在鼠标易失内存里，
+// 深度睡眠唤醒后固件可能复位，所以守护模式在设备重连时自动重新应用；
+// 周期性复检默认关闭（周期探测会让使用中的罗技 BLE 鼠标断连，实测每 30 秒一次）。
 //
 // 协议参考 OpenLogi (https://github.com/AprilNEA/OpenLogi, Apache-2.0/MIT):
 //   - HID++ 2.0 短报告: [0x10, dev_idx, feat_idx, func|sw, p0, p1, p2]  (7 字节)
@@ -18,7 +19,7 @@
 // 而 hidapi 的独立读线程实现工作正常。
 //
 // 用法:
-//   logi_scroll run                 守护模式：轮询检测并保持反转，睡眠唤醒自动恢复（开机自启用）
+//   logi_scroll run                 守护模式：轮询检测并保持反转，设备重连自动重新应用（开机自启用）
 //   logi_scroll status              列出当前连接的罗技设备及滚轮状态
 //   logi_scroll toggle [--on|--off] 一次性切换反转方向（默认来回切换）
 //   logi_scroll install             安装 LaunchAgent 开机自启
@@ -36,7 +37,6 @@ let SW_ID: UInt8 = 0x01
 let FEATURE_HIRES_WHEEL: UInt16 = 0x2121
 let WHEEL_INVERT: UInt8 = 0x04
 let POLL_SECONDS: TimeInterval = 2
-let REVERIFY_SECONDS: TimeInterval = 30   // 已应用设备复检间隔（睡眠唤醒后固件可能清掉反转位）
 let FAIL_BACKOFF_SECONDS: TimeInterval = 30  // 打开/应用失败后的退避与日志限频
 
 let AGENT_LABEL = "com.garethng.logi-scroll"
@@ -322,6 +322,11 @@ func resolveTargets(_ dev: IOHIDDevice, silent: Bool = false) -> [(device: LogiD
 
 func runDaemon() {
     let mgr = makeManager()
+    // 周期性复检默认关闭：对使用中的鼠标周期发 HID++ 探测会导致断连
+    // （本机 MX Anywhere 3S 实测每 30 秒断一次，动一下鼠标才恢复）。
+    // 实验/特殊场景用环境变量 LOGI_SCROLL_REVERIFY_SECONDS 开启（如 =30）。
+    let reverifySeconds = ProcessInfo.processInfo.environment["LOGI_SCROLL_REVERIFY_SECONDS"]
+        .flatMap { TimeInterval($0) } ?? 0
     var applied = Set<String>()
     var lastFailLog: [String: Date] = [:]  // path → 最近失败时间（失败退避 + 日志限频）
     var lastVerify: [String: Date] = [:]   // key → 最近复检时间
@@ -333,10 +338,10 @@ func runDaemon() {
             seenPaths.insert(path)
             // 失败退避：最近打开/应用失败过的 path 30 秒内不再尝试（避免日志刷屏）
             if let t = lastFailLog[path], Date().timeIntervalSince(t) < FAIL_BACKOFF_SECONDS { continue }
-            // 已应用过的设备：睡眠唤醒后固件可能清掉反转位，周期性复检并补写。
-            // 蓝牙睡眠唤醒不换 registry path，只能靠复检发现。
-            if let key = applied.first(where: { $0.hasPrefix(path + "|") }) {
-                guard Date().timeIntervalSince(lastVerify[key] ?? .distantPast) >= REVERIFY_SECONDS else { continue }
+            // 已应用过的设备：复检开启时周期检查反转位并补写（默认关闭，见上）；
+            // 否则跳过——设备重连换 path 时自会走下面的重新应用逻辑。
+            if reverifySeconds > 0, let key = applied.first(where: { $0.hasPrefix(path + "|") }) {
+                guard Date().timeIntervalSince(lastVerify[key] ?? .distantPast) >= reverifySeconds else { continue }
                 lastVerify[key] = Date()
                 // 从 key 还原目标（path|deviceIndex|serial|pid），避免整轮重新探测
                 let parts = key.split(separator: "|").map(String.init)
@@ -363,6 +368,7 @@ func runDaemon() {
                 }
                 continue
             }
+            if applied.contains(where: { $0.hasPrefix(path + "|") }) { continue }
             // 新设备：探测并首次应用
             for (d, label) in resolveTargets(dev, silent: true) {
                 if applied.contains(d.key) { continue }
